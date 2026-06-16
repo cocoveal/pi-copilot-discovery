@@ -1,0 +1,39 @@
+{
+  "name": "pi-copilot-discovery",
+  "version": "0.1.0",
+  "description": "Dynamic GitHub Copilot model discovery for pi — replaces pi-ai's static catalog with the live /models list from your Copilot tenant.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Miles Possing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/milespossing/pi-copilot-discovery.git"
+  },
+  "bugs": {
+    "url": "https://github.com/milespossing/pi-copilot-discovery/issues"
+  },
+  "homepage": "https://github.com/milespossing/pi-copilot-discovery#readme",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "github-copilot",
+    "copilot",
+    "llm",
+    "ai"
+  ],
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.4",
+    "@types/node": "^25.9.3"
+  }
+}
