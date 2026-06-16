@@ -52,13 +52,13 @@ intact — this is a drop-in upgrade of the provider, not a parallel one.
 ### As a pi package (recommended once published)
 
 ```bash
-pi install npm:pi-copilot-discovery
+pi install npm:@milespossing/pi-copilot-discovery
 ```
 
 Or try it for one session without installing:
 
 ```bash
-pi -e npm:pi-copilot-discovery
+pi -e npm:@milespossing/pi-copilot-discovery
 ```
 
 ### Directly from git
@@ -90,7 +90,8 @@ Either form auto-discovers as a global pi extension. Restart pi (or run
 | Command                         | What it does                                              |
 | ------------------------------- | --------------------------------------------------------- |
 | `/login github-copilot`         | Device-code login + enable policies on all live models    |
-| `/copilot-discovery-refresh`    | Re-fetch the `/models` catalog without restarting pi      |
+| `/copilot-refresh`              | Re-fetch the `/models` catalog without restarting pi      |
+| `/copilot-discovery-refresh`    | Alias of `/copilot-refresh` (back-compat)                 |
 | `/logout github-copilot`        | (Built-in) Clear stored credentials                       |
 
 ## How it works
@@ -99,14 +100,19 @@ Either form auto-discovers as a global pi extension. Restart pi (or run
 pi starts
   └─ extension factory runs (awaited by pi before startup completes)
        ├─ read ~/.pi/agent/auth.json["github-copilot"]
-       ├─ if credentials present & not expired:
-       │     GET <proxy>/models  →  ProviderModelConfig[]
+       ├─ if credentials present:
+       │     ├─ if access token is stale (≤30s from expiry): refresh in memory
+       │     │     via pi-ai's refreshGitHubCopilotToken (no disk write)
+       │     ├─ GET <proxy>/models  →  ProviderModelConfig[]
+       │     │     └─ on 401: refresh once and retry
        │     ├─ classify each model's family → { api, reasoning, compat }
-       │     └─ pi.registerProvider("github-copilot", { models, oauth, streamSimple, ... })
+       │     ├─ pi.registerProvider("github-copilot", { models, oauth, streamSimple, ... })
+       │     └─ arm setTimeout to re-discover ~60s before token expiry
        └─ if no credentials: register with models: [] (login still surfaces in /login)
 
 per request
-  └─ pi resolves apiKey via oauth.getApiKey(creds)
+  └─ pi resolves apiKey via oauth.getApiKey(creds)        ← pi auth-storage refreshes
+       │                                                    + persists if expired
        └─ pi-copilot-discovery.streamSimple
             ├─ inject {X-Initiator, Openai-Intent, [Copilot-Vision-Request]}
             └─ dispatch on model.api → pi-ai streamSimple* (Anthropic / OpenAI Responses / Completions)
@@ -129,8 +135,9 @@ uncertain we choose an `api` the model is *usable* under even if not optimal.
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `/model` shows no Copilot entries before login | No credentials yet. | Run `/login github-copilot`. |
-| `/model` empty *after* login on a fresh pi start | Stored access token was already expired; discovery was skipped to let pi refresh on first use. | Run `/copilot-discovery-refresh`. |
-| Some model returns 403 the first time you use it | Tenant policy was `"unconfigured"` and post-login policy enable didn't succeed. | Run `/copilot-discovery-refresh` (or re-run `/login github-copilot`). |
+| `/model` empty *after* login on a fresh pi start | In-memory refresh on load failed (network blip, expired refresh token, tenant outage). Check stderr for `pi-copilot-discovery: in-memory refresh failed`. | Run `/copilot-refresh`; if that also fails, re-run `/login github-copilot`. |
+| Some model returns 403 the first time you use it | Tenant policy was `"unconfigured"` and post-login policy enable didn't succeed. | Run `/copilot-refresh` (or re-run `/login github-copilot`). |
+| `pi-copilot-discovery: proactive refresh failed` in stderr | Background refresh timer hit a network/auth error. Non-fatal; the next user action will trigger pi's own refresh path. | Usually self-heals; run `/copilot-refresh` to force-retry. |
 | Editor-Version / User-Agent rejected by the work proxy | pi-ai bumped its hardcoded Copilot client strings. | Update `COPILOT_HEADERS` in `models.ts` and `index.ts` to the new values. |
 | A new family is misrouted to `openai-completions` | Default fallback. | Open an issue with the model id and tenant `capabilities.family`, or send a PR refining `families.ts`. |
 

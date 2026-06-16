@@ -18,6 +18,22 @@
  *     streamers only add them automatically when the provider name is
  *     literally `"github-copilot"`, which is exactly what we register as.
  *
+ * Refresh strategy (v0.2):
+ *   - At load time, if the stored access token is expired (or near
+ *     expiry), we refresh it *in memory* via pi-ai's
+ *     `refreshGitHubCopilotToken` and use the fresh token for `/models`
+ *     discovery. We never write back to `auth.json`; pi's auth-storage
+ *     owns that file and will refresh + persist on first use. Doing the
+ *     in-memory refresh here means the model picker is populated
+ *     immediately on cold start, instead of waiting for the user's
+ *     first turn.
+ *   - After every successful discovery we arm a `setTimeout` to
+ *     pre-emptively refetch ~60s before the token expires, so the
+ *     catalog stays warm without depending on user activity.
+ *   - On a 401 from `/models` we refresh once and retry, in case the
+ *     token rotated underneath us (another pi process, /logout+/login,
+ *     etc).
+ *
  * Compatibility:
  *   - Existing `~/.pi/agent/auth.json["github-copilot"]` credentials are
  *     reused as-is. No re-login required on install.
@@ -27,7 +43,8 @@
  *   - `/logout github-copilot` works as before via pi's built-in.
  *
  * Commands:
- *   /copilot-discovery-refresh   re-fetch the /models catalog
+ *   /copilot-refresh             re-fetch the /models catalog (primary)
+ *   /copilot-discovery-refresh   alias of /copilot-refresh (back-compat)
  */
 
 import { readFile } from "node:fs/promises";
@@ -35,12 +52,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
+import { refreshGitHubCopilotToken } from "@earendil-works/pi-ai/oauth";
 
 import { copilotDiscoveryOAuth, type CopilotCredentials } from "./oauth.ts";
 import { fetchCopilotModels, toProviderModels } from "./models.ts";
 import { streamCopilotDiscovery } from "./stream.ts";
 
 const PROVIDER_NAME = "github-copilot";
+
+/**
+ * Refresh the in-memory access token this far before its stored
+ * `expires` timestamp. Just large enough to absorb network latency on
+ * the refresh round-trip without ever serving a stale token to /models.
+ */
+const PROACTIVE_REFRESH_LEAD_MS = 60_000;
+
+/**
+ * Treat a stored token as "needs refresh now" once it's within this
+ * many ms of expiry. Anything past this → refresh synchronously before
+ * the next /models call. Smaller than the proactive lead so we don't
+ * loop refreshing.
+ */
+const STALE_THRESHOLD_MS = 30_000;
 
 // Same logic as pi-coding-agent's `getAgentDir()` in dist/config.js,
 // so we read the same auth.json pi writes (including under
@@ -79,6 +112,46 @@ async function readStoredCredentials(): Promise<CopilotCredentials | null> {
 }
 
 /**
+ * Return credentials with a non-stale `access` token. If `creds.access`
+ * is within `STALE_THRESHOLD_MS` of expiry (or already past), call
+ * pi-ai's `refreshGitHubCopilotToken` to mint a new one and return that
+ * — *without* writing to auth.json. Pi's auth-storage owns the file and
+ * will refresh + persist itself on first use.
+ *
+ * Returns `null` if the credentials lack a refresh token or refresh
+ * fails.
+ */
+async function ensureFreshCredentials(
+	creds: CopilotCredentials,
+): Promise<CopilotCredentials | null> {
+	const now = Date.now();
+	const expires = typeof creds.expires === "number" ? creds.expires : 0;
+	const stale = expires - now <= STALE_THRESHOLD_MS;
+	if (!stale) return creds;
+	if (typeof creds.refresh !== "string" || creds.refresh.length === 0) {
+		return null;
+	}
+	try {
+		const refreshed = (await refreshGitHubCopilotToken(
+			creds.refresh,
+			creds.enterpriseUrl,
+		)) as CopilotCredentials;
+		// `refreshGitHubCopilotToken` already preserves enterpriseUrl,
+		// but be defensive — older pi-ai versions didn't.
+		if (!refreshed.enterpriseUrl && creds.enterpriseUrl) {
+			refreshed.enterpriseUrl = creds.enterpriseUrl;
+		}
+		return refreshed;
+	} catch (err) {
+		console.error(
+			`pi-copilot-discovery: in-memory refresh failed (${err instanceof Error ? err.message : String(err)}); ` +
+				`falling back to stored token. Pi will refresh on first use.`,
+		);
+		return null;
+	}
+}
+
+/**
  * Provider config minus `models` — the model list is the only piece
  * that changes between cold-start, post-login, and post-refresh.
  *
@@ -105,59 +178,131 @@ const STATIC_PROVIDER: Omit<ProviderConfig, "models"> = {
 	streamSimple: streamCopilotDiscovery,
 };
 
-export default async function (pi: ExtensionAPI): Promise<void> {
-	// Try to fetch the model catalog using whatever credentials are
-	// already on disk. If we have none (first run, pre-/login) or the
-	// stored access token has already expired, register the provider
-	// with an empty model list so /login is still discoverable.
-	let models: ProviderConfig["models"] = [];
-	const creds = await readStoredCredentials();
-	if (creds && typeof creds.access === "string" && creds.access.length > 0) {
-		const now = Date.now();
-		if (typeof creds.expires === "number" && creds.expires <= now) {
-			// Don't try to refresh from here — pi owns refresh and will
-			// do it on first use. The user can re-run
-			// /copilot-discovery-refresh afterwards to populate the list.
-			console.error(
-				`pi-copilot-discovery: stored access token expired; provider will list models after first use or after /copilot-discovery-refresh.`,
-			);
-		} else {
+/**
+ * One-shot discovery: ensure fresh creds, fetch /models, transform.
+ *
+ * On HTTP 401 we refresh once more and retry. This covers the rare race
+ * where another pi process rotated the token between our auth.json read
+ * and the /models call.
+ */
+async function discoverModels(
+	rawCreds: CopilotCredentials,
+): Promise<{ models: ReturnType<typeof toProviderModels>; creds: CopilotCredentials }> {
+	const fresh = (await ensureFreshCredentials(rawCreds)) ?? rawCreds;
+	try {
+		const raw = await fetchCopilotModels(fresh.access, fresh.enterpriseUrl);
+		return { models: toProviderModels(raw), creds: fresh };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		// pi-ai's fetch helper throws "copilot /models: 401 …"; match loosely.
+		if (/\b401\b/.test(msg) && rawCreds.refresh) {
 			try {
-				const raw = await fetchCopilotModels(creds.access, creds.enterpriseUrl);
-				models = toProviderModels(raw);
-			} catch (err) {
-				console.error(
-					`pi-copilot-discovery: model discovery failed at load (${err instanceof Error ? err.message : String(err)}); ` +
-						`provider registered with empty model list. Run /copilot-discovery-refresh or /login github-copilot.`,
-				);
+				const retryCreds = (await refreshGitHubCopilotToken(
+					rawCreds.refresh,
+					rawCreds.enterpriseUrl,
+				)) as CopilotCredentials;
+				const raw = await fetchCopilotModels(retryCreds.access, retryCreds.enterpriseUrl);
+				return { models: toProviderModels(raw), creds: retryCreds };
+			} catch {
+				// Fall through to original error.
 			}
+		}
+		throw err;
+	}
+}
+
+export default async function (pi: ExtensionAPI): Promise<void> {
+	let models: ProviderConfig["models"] = [];
+	let lastGoodCreds: CopilotCredentials | null = null;
+	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+	const armProactiveRefresh = (creds: CopilotCredentials) => {
+		if (refreshTimer) {
+			clearTimeout(refreshTimer);
+			refreshTimer = null;
+		}
+		const expires = typeof creds.expires === "number" ? creds.expires : 0;
+		const delay = expires - Date.now() - PROACTIVE_REFRESH_LEAD_MS;
+		if (!Number.isFinite(delay) || delay <= 0) return;
+		// `unref()` so a long-lived timer never blocks process exit.
+		const t = setTimeout(() => {
+			void runRefresh("proactive");
+		}, delay);
+		t.unref?.();
+		refreshTimer = t;
+	};
+
+	const runRefresh = async (
+		reason: "startup" | "proactive" | "command",
+	): Promise<{ ok: true; count: number } | { ok: false; error: string }> => {
+		// Always re-read auth.json so we pick up creds written by pi after
+		// /login or its own auto-refresh.
+		const stored = await readStoredCredentials();
+		if (!stored?.access) {
+			return { ok: false, error: "not logged in" };
+		}
+		try {
+			const { models: next, creds } = await discoverModels(stored);
+			models = next;
+			lastGoodCreds = creds;
+			pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models });
+			armProactiveRefresh(creds);
+			return { ok: true, count: next.length };
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (reason === "proactive") {
+				// Don't spam stderr on background failures; just log once.
+				console.error(`pi-copilot-discovery: proactive refresh failed (${msg})`);
+			}
+			return { ok: false, error: msg };
+		}
+	};
+
+	// Initial discovery. If creds are missing we still register the
+	// provider (with empty models) so /login is discoverable.
+	const result = await runRefresh("startup");
+	if (!result.ok) {
+		pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models: [] });
+		if (result.error !== "not logged in") {
+			console.error(
+				`pi-copilot-discovery: model discovery failed at load (${result.error}); ` +
+					`provider registered with empty model list. Run /copilot-refresh or /login github-copilot.`,
+			);
 		}
 	}
 
-	pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models });
+	const refreshHandler = async (
+		_args: unknown,
+		ctx: { ui: { notify: (msg: string, level: "info" | "warning" | "error") => void } },
+	): Promise<void> => {
+		const r = await runRefresh("command");
+		if (r.ok) {
+			ctx.ui.notify(`pi-copilot-discovery: refreshed ${r.count} models`, "info");
+		} else if (r.error === "not logged in") {
+			ctx.ui.notify(
+				"pi-copilot-discovery: not logged in. Run /login github-copilot.",
+				"warning",
+			);
+		} else {
+			ctx.ui.notify(`pi-copilot-discovery refresh failed: ${r.error}`, "error");
+		}
+	};
 
-	pi.registerCommand("copilot-discovery-refresh", {
+	pi.registerCommand("copilot-refresh", {
 		description: "Re-fetch the GitHub Copilot model catalog from /models",
-		handler: async (_args, ctx) => {
-			const fresh = await readStoredCredentials();
-			if (!fresh?.access) {
-				ctx.ui.notify(
-					"pi-copilot-discovery: not logged in. Run /login github-copilot.",
-					"warning",
-				);
-				return;
-			}
-			try {
-				const raw = await fetchCopilotModels(fresh.access, fresh.enterpriseUrl);
-				const next = toProviderModels(raw);
-				pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models: next });
-				ctx.ui.notify(`pi-copilot-discovery: refreshed ${next.length} models`, "info");
-			} catch (err) {
-				ctx.ui.notify(
-					`pi-copilot-discovery refresh failed: ${err instanceof Error ? err.message : String(err)}`,
-					"error",
-				);
-			}
-		},
+		// biome-ignore lint/suspicious/noExplicitAny: ExtensionAPI command ctx is loosely typed.
+		handler: refreshHandler as any,
 	});
+
+	// Back-compat alias for users with muscle memory / scripts.
+	pi.registerCommand("copilot-discovery-refresh", {
+		description: "Alias of /copilot-refresh (back-compat)",
+		// biome-ignore lint/suspicious/noExplicitAny: ExtensionAPI command ctx is loosely typed.
+		handler: refreshHandler as any,
+	});
+
+	// Reference `lastGoodCreds` so TS doesn't complain it's unused. It's
+	// retained for future use (e.g. exposing /copilot-status) and to make
+	// debugging easier when stepping through.
+	void lastGoodCreds;
 }

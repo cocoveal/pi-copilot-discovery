@@ -30,10 +30,10 @@ pi
 > /login github-copilot               # device-code flow, enables policies
 > /model                              # pick a copilot model
 > hi
-> /copilot-discovery-refresh          # re-fetch /models without restart
+> /copilot-refresh                    # re-fetch /models without restart
 ```
 
-The interactive `/login github-copilot` and `/copilot-discovery-refresh`
+The interactive `/login github-copilot` and `/copilot-refresh`
 exercises are the only "integration tests" we have. Run them before any
 non-trivial change.
 
@@ -55,7 +55,8 @@ add Prettier without a `.prettierrc` that sets `useTabs: true`.
 .
 ├── package.json     pi extension manifest, no runtime npm deps
 ├── src/
-│   ├── index.ts     async factory; registerProvider + /copilot-discovery-refresh
+│   ├── index.ts     async factory: registerProvider, in-memory refresh,
+│   │                proactive refresh timer, /copilot-refresh command
 │   ├── oauth.ts     wraps pi-ai loginGitHubCopilot/refresh; enables policies
 │   ├── models.ts    fetch /models, build ProviderModelConfig[]
 │   ├── families.ts  pure: family/id → { api, reasoning, thinkingLevelMap, compat }
@@ -154,13 +155,26 @@ Keep both regex shapes covered.
 `src/index.ts` opens `~/.pi/agent/auth.json` (respecting
 `PI_CODING_AGENT_DIR`) once, in the async factory. This is the
 documented escape hatch — see `docs/PLAN.md` § 5.6 "Note on the
-credential-read sidecar". Do *not* call `refreshGitHubCopilotToken`
-from the factory: pi owns refresh, and double-refreshing risks lock
-contention on `auth.json`.
+credential-read sidecar".
 
-If the stored token is expired at load time, register an empty model
-list and let the user run `/copilot-discovery-refresh` after pi
-refreshes on first use.
+**Refresh in the factory is allowed, but only in memory.** Since
+v0.2 the factory will call `refreshGitHubCopilotToken` to mint a
+fresh access token when the stored one is within 30s of expiry, and
+use that token for the load-time `/models` call. The result is
+*never* written back to `auth.json` — pi's auth-storage owns that
+file and refreshes/persists itself on first use. Two independent
+refresh paths converge naturally on the same `ghu_*` PAT (the
+refresh side never rotates), so there's no lock contention and no
+divergence.
+
+Do *not* write to `auth.json` from this extension. Pi serializes
+writes with `withLockAsync` and we don't hold that lock; bypassing
+it risks clobbering a concurrent refresh from another pi process.
+
+**Proactive refresh.** After every successful discovery the factory
+arms a `setTimeout` to re-fetch `/models` ~60s before the access
+token expires (with `unref()` so it never blocks process exit).
+This keeps the catalog warm without depending on user activity.
 
 ## Dependencies
 
