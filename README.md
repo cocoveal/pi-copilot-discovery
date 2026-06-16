@@ -52,12 +52,19 @@ intact — this is a drop-in upgrade of the provider, not a parallel one.
 ### As a pi package (recommended once published)
 
 ```bash
-pi install git:github.com/milespossing/pi-copilot-discovery
+pi install npm:pi-copilot-discovery
 ```
 
 Or try it for one session without installing:
 
 ```bash
+pi -e npm:pi-copilot-discovery
+```
+
+### Directly from git
+
+```bash
+pi install git:github.com/milespossing/pi-copilot-discovery
 pi -e git:github.com/milespossing/pi-copilot-discovery
 ```
 
@@ -136,6 +143,16 @@ uncertain we choose an `api` the model is *usable* under even if not optimal.
   `getGitHubCopilotBaseUrl`, `normalizeDomain`, and the `streamSimple*`
   family).
 - Node.js ≥ 22.19.0 (matches pi's `engines` requirement).
+
+## Publishing
+
+```bash
+npm version patch
+git push origin main --follow-tags
+```
+
+Pushing a `v*.*.*` tag triggers the npm publish workflow, which verifies the
+tag matches `package.json` and publishes the package to npm.
 
 ## Layout
 
