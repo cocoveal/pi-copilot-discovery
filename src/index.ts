@@ -34,6 +34,21 @@
  *     token rotated underneath us (another pi process, /logout+/login,
  *     etc).
  *
+ * Resilience (v0.2.1):
+ *   - At WSL/login cold start the network, DNS, and clock are often not
+ *     ready for a second or two, so the first refresh/`/models` call can
+ *     fail with a spurious `401 Bad credentials` even though the stored
+ *     `ghu_*` token is perfectly valid. Startup discovery now retries
+ *     with backoff across those transient errors instead of giving up.
+ *   - If discovery still fails, we register the provider in
+ *     *override-only* mode (no `models` key), which keeps pi's built-in
+ *     static github-copilot catalog intact rather than wiping it to an
+ *     empty list. The session is always usable; worst case we behave
+ *     exactly like pi's built-in Copilot provider until the next
+ *     successful refresh upgrades us to the live tenant catalog.
+ *   - A working live catalog is never downgraded by a *later* failed
+ *     refresh, and a failed proactive refresh re-arms a short retry.
+ *
  * Compatibility:
  *   - Existing `~/.pi/agent/auth.json["github-copilot"]` credentials are
  *     reused as-is. No re-login required on install.
@@ -74,6 +89,32 @@ const PROACTIVE_REFRESH_LEAD_MS = 60_000;
  * loop refreshing.
  */
 const STALE_THRESHOLD_MS = 30_000;
+
+/**
+ * Backoff schedule (ms) for transient cold-start discovery failures.
+ *
+ * At WSL/login cold start the network stack, DNS, and even the system
+ * clock are frequently not ready for the first second or two, which
+ * surfaces as a spurious `401 Bad credentials` from
+ * `copilot_internal/v2/token` or a `fetch failed`/`ENOTFOUND` on
+ * `/models`. The stored `ghu_*` refresh token is fine — it just needs a
+ * second attempt. We retry a few times before giving up and falling
+ * back to the built-in static catalog.
+ */
+const STARTUP_RETRY_BACKOFF_MS = [500, 1500, 3000] as const;
+
+/** Errors worth retrying: transient network / token-mint hiccups. */
+function isRetriableDiscoveryError(msg: string): boolean {
+	return (
+		/\b401\b/.test(msg) ||
+		/Bad credentials/i.test(msg) ||
+		/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|ECONNRESET|fetch failed|network|socket hang up/i.test(
+			msg,
+		)
+	);
+}
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // Same logic as pi-coding-agent's `getAgentDir()` in dist/config.js,
 // so we read the same auth.json pi writes (including under
@@ -142,11 +183,11 @@ async function ensureFreshCredentials(
 			refreshed.enterpriseUrl = creds.enterpriseUrl;
 		}
 		return refreshed;
-	} catch (err) {
-		console.error(
-			`pi-copilot-discovery: in-memory refresh failed (${err instanceof Error ? err.message : String(err)}); ` +
-				`falling back to stored token. Pi will refresh on first use.`,
-		);
+	} catch {
+		// Silent: a refresh miss is not necessarily fatal (the
+		// stale-but-not-yet-expired access token may still satisfy
+		// /models), and any genuinely fatal outcome is reported once by
+		// the discovery layer rather than once per retry attempt.
 		return null;
 	}
 }
@@ -211,10 +252,47 @@ async function discoverModels(
 	}
 }
 
+/**
+ * Discovery with bounded retry across transient cold-start failures.
+ * Re-reads creds from auth.json between attempts so we pick up a token
+ * pi may have refreshed underneath us.
+ */
+async function discoverWithRetry(
+	initial: CopilotCredentials,
+	backoff: readonly number[],
+): Promise<{ models: ReturnType<typeof toProviderModels>; creds: CopilotCredentials }> {
+	let creds = initial;
+	let lastErr: unknown;
+	for (let attempt = 0; attempt <= backoff.length; attempt++) {
+		try {
+			return await discoverModels(creds);
+		} catch (err) {
+			lastErr = err;
+			const msg = err instanceof Error ? err.message : String(err);
+			if (attempt === backoff.length || !isRetriableDiscoveryError(msg)) break;
+			await delay(backoff[attempt]);
+			creds = (await readStoredCredentials()) ?? creds;
+		}
+	}
+	throw lastErr;
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
 	let models: ProviderConfig["models"] = [];
 	let lastGoodCreds: CopilotCredentials | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/**
+	 * Override-only registration: no `models` key. Per pi's model-registry
+	 * this keeps the *built-in* static github-copilot catalog intact and
+	 * only attaches our oauth + streamSimple + headers. Used as the
+	 * fallback whenever live discovery fails so a transient cold-start
+	 * blip never leaves the session with an empty model list. Worst case
+	 * we behave exactly like pi's built-in Copilot provider.
+	 */
+	const registerFallback = () => {
+		pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER });
+	};
 
 	const armProactiveRefresh = (creds: CopilotCredentials) => {
 		if (refreshTimer) {
@@ -241,8 +319,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (!stored?.access) {
 			return { ok: false, error: "not logged in" };
 		}
+		const backoff = reason === "startup" ? STARTUP_RETRY_BACKOFF_MS : [];
 		try {
-			const { models: next, creds } = await discoverModels(stored);
+			const { models: next, creds } = await discoverWithRetry(stored, backoff);
+			if (next.length === 0) {
+				// Tenant returned nothing usable. Don't clobber a catalog we
+				// already have; keep built-in models via the fallback path.
+				if (models.length === 0) registerFallback();
+				return { ok: false, error: "discovery returned no models" };
+			}
 			models = next;
 			lastGoodCreds = creds;
 			pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models });
@@ -250,23 +335,37 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return { ok: true, count: next.length };
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
+			// Never downgrade a working live catalog because a *later* refresh
+			// failed (e.g. a background blip). Only fall back when we have
+			// nothing live yet.
+			if (models.length === 0) registerFallback();
 			if (reason === "proactive") {
-				// Don't spam stderr on background failures; just log once.
+				// Don't spam stderr on background failures; just log once, and
+				// re-arm a short retry so a single blip doesn't stop us keeping
+				// the catalog warm for the rest of the session.
 				console.error(`pi-copilot-discovery: proactive refresh failed (${msg})`);
+				if (refreshTimer) clearTimeout(refreshTimer);
+				refreshTimer = setTimeout(() => void runRefresh("proactive"), 60_000);
+				refreshTimer.unref?.();
 			}
 			return { ok: false, error: msg };
 		}
 	};
 
-	// Initial discovery. If creds are missing we still register the
-	// provider (with empty models) so /login is discoverable.
+	// Initial discovery. On any failure `runRefresh` has already attached
+	// our oauth/streamSimple to pi's built-in static catalog via
+	// `registerFallback`, so the session stays usable and /login works.
 	const result = await runRefresh("startup");
 	if (!result.ok) {
-		pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER, models: [] });
-		if (result.error !== "not logged in") {
+		if (result.error === "not logged in") {
+			// No creds yet: still attach our oauth so /login github-copilot
+			// enables the full tenant catalog. Built-in static models remain.
+			registerFallback();
+		} else {
 			console.error(
-				`pi-copilot-discovery: model discovery failed at load (${result.error}); ` +
-					`provider registered with empty model list. Run /copilot-refresh or /login github-copilot.`,
+				`pi-copilot-discovery: live discovery failed at load (${result.error}); ` +
+					`using built-in Copilot catalog. It will upgrade automatically on ` +
+					`the next refresh, or run /copilot-refresh.`,
 			);
 		}
 	}
