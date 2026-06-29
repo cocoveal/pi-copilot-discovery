@@ -107,8 +107,8 @@ pi starts
             └─ pi.registerProvider("github-copilot", { models, oauth, streamSimple, ... })
 
 /login github-copilot
-  └─ oauth.login mints fresh creds, enables model policies, then triggers one
-     model discovery pass so /model updates immediately
+  └─ pi-ai built-in mints fresh creds; extension enables model policies,
+     then triggers one model discovery pass so /model updates immediately
 
 /copilot-refresh
   └─ one manual re-fetch of /models
@@ -145,7 +145,7 @@ uncertain we choose an `api` the model is *usable* under even if not optimal.
 - pi-coding-agent ≥ 0.78.0 (uses the async extension factory, per-model
   `api` override, OAuth `ProviderConfig`, and the `streamSimple` escape
   hatch).
-- pi-ai ≥ 0.78.0 (uses `loginGitHubCopilot`, `refreshGitHubCopilotToken`,
+- pi-ai ≥ 0.78.0 (uses `githubCopilotOAuthProvider`,
   `getGitHubCopilotBaseUrl`, `normalizeDomain`, and the `streamSimple*`
   family).
 - Node.js ≥ 22.19.0 (matches pi's `engines` requirement).
@@ -167,7 +167,7 @@ tag matches `package.json` and publishes the package to npm.
 ├── package.json     pi extension manifest, no runtime npm deps
 ├── src/
 │   ├── index.ts     async factory: registerProvider + /command
-│   ├── oauth.ts     wraps pi-ai loginGitHubCopilot/refresh; enables policies
+│   ├── oauth.ts     delegates login/refresh to pi-ai built-in; enables policies
 │   ├── models.ts    fetch /models, build ProviderModelConfig[]
 │   ├── families.ts  pure: family/id → { api, reasoning, thinkingLevelMap, compat }
 │   ├── stream.ts    streamSimple wrapper: inject headers, dispatch

@@ -55,9 +55,10 @@ add Prettier without a `.prettierrc` that sets `useTabs: true`.
 .
 ├── package.json     pi extension manifest, no runtime npm deps
 ├── src/
-│   ├── index.ts     async factory: registerProvider, in-memory refresh,
-│   │                proactive refresh timer, /copilot-refresh command
-│   ├── oauth.ts     wraps pi-ai loginGitHubCopilot/refresh; enables policies
+│   ├── index.ts     async factory: registerProvider, one-shot discovery,
+│   │                /copilot-refresh command (no refresh/timer/writes)
+│   ├── oauth.ts     delegates login/refresh/getApiKey to pi-ai built-in;
+│   │                overrides modifyModels only; enables policies @login
 │   ├── models.ts    fetch /models, build ProviderModelConfig[]
 │   ├── families.ts  pure: family/id → { api, reasoning, thinkingLevelMap, compat }
 │   ├── stream.ts    streamSimple wrapper: inject headers, dispatch
@@ -135,9 +136,11 @@ by hand. The only thing we add is the header injection.
 
 ### Do not bypass pi-ai's OAuth helpers
 
-`loginGitHubCopilot` and `refreshGitHubCopilotToken` from
-`@earendil-works/pi-ai/oauth` are the canonical implementations. Wrap
-them, don't reimplement them. Upstream domain changes (e.g. a new GHE
+The `github-copilot` OAuth lifecycle is owned by pi-ai's built-in
+`githubCopilotOAuthProvider`. `src/oauth.ts` spreads it and overrides
+only `modifyModels`. Do not reimplement `login`/`refreshToken`/
+`getApiKey`, and do not call `loginGitHubCopilot`/
+`refreshGitHubCopilotToken` directly. Upstream domain changes (e.g. a new GHE
 proxy host shape) land in our extension for free.
 
 ### Heuristics in `families.ts` are intentionally conservative
@@ -150,31 +153,30 @@ The function accepts either an id or a `capabilities.family` string —
 Copilot exposes both formats (`claude-haiku-4.5` and `claude-3.7-sonnet`).
 Keep both regex shapes covered.
 
-### Credentials are read directly from `auth.json` at load time
+### Token lifecycle is 100% delegated — NEVER mint or refresh here
+
+The extension must NOT run its own login, token refresh, or proactive
+refresh timer. Earlier versions did (v0.2 minted tokens in-factory and
+armed a `setTimeout`; v0.3 reimplemented `login`/`refreshToken`). Both
+ran a *parallel* mint/refresh cycle against the same `ghu_*` device-flow
+grant as pi's own auth-storage. The extra churn could get GitHub to
+revoke the grant — the user-visible symptom was "my Copilot token gets
+wiped after a short period; removing the extension fixes it."
+
+`src/oauth.ts` now delegates `login`, `refreshToken`, and `getApiKey`
+verbatim to pi-ai's built-in `githubCopilotOAuthProvider`. The only
+override is `modifyModels` (rewrite baseUrl, no `availableModelIds`
+filter — that filter would strip the preview models we discover). The
+policy-enable POST runs once at login using the short-lived access
+token, never the grant. Result: token lifecycle is byte-identical to a
+vanilla pi install with no extension.
 
 `src/index.ts` opens `~/.pi/agent/auth.json` (respecting
-`PI_CODING_AGENT_DIR`) once, in the async factory. This is the
-documented escape hatch — see `docs/PLAN.md` § 5.6 "Note on the
-credential-read sidecar".
-
-**Refresh in the factory is allowed, but only in memory.** Since
-v0.2 the factory will call `refreshGitHubCopilotToken` to mint a
-fresh access token when the stored one is within 30s of expiry, and
-use that token for the load-time `/models` call. The result is
-*never* written back to `auth.json` — pi's auth-storage owns that
-file and refreshes/persists itself on first use. Two independent
-refresh paths converge naturally on the same `ghu_*` PAT (the
-refresh side never rotates), so there's no lock contention and no
-divergence.
-
-Do *not* write to `auth.json` from this extension. Pi serializes
-writes with `withLockAsync` and we don't hold that lock; bypassing
-it risks clobbering a concurrent refresh from another pi process.
-
-**Proactive refresh.** After every successful discovery the factory
-arms a `setTimeout` to re-fetch `/models` ~60s before the access
-token expires (with `unref()` so it never blocks process exit).
-This keeps the catalog warm without depending on user activity.
+`PI_CODING_AGENT_DIR`) **read-only**, once, to seed the load-time
+`/models` call with whatever token is already stored. It never writes,
+refreshes, or arms timers. Do *not* write to `auth.json` and do *not*
+call `refreshGitHubCopilotToken`/`loginGitHubCopilot` directly — pi's
+auth-storage owns refresh+persist (under `withLockAsync`).
 
 ## Dependencies
 
@@ -185,7 +187,7 @@ section in `package.json`. Available imports (provided by pi at runtime):
 | --------------------------------------- | ----------------------------------------------------------- |
 | `@earendil-works/pi-coding-agent`       | `ExtensionAPI`, `ProviderConfig`, `ProviderModelConfig`     |
 | `@earendil-works/pi-ai`                 | `Message`, `Model`, `Api`, `Context`, `streamSimple*`, ...  |
-| `@earendil-works/pi-ai/oauth`           | `loginGitHubCopilot`, `refreshGitHubCopilotToken`, ...      |
+| `@earendil-works/pi-ai/oauth`           | `githubCopilotOAuthProvider`, `getGitHubCopilotBaseUrl`, `normalizeDomain` |
 | `node:fs/promises`, `node:os`, `node:path` | Reading `auth.json`                                      |
 
 Tested against pi-coding-agent ≥ 0.78.0 and pi-ai ≥ 0.78.0.
