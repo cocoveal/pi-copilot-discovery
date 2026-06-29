@@ -91,6 +91,41 @@ per request
 
 ## Conventions and Footguns
 
+### NEVER hardcode the API base URL (individual vs. enterprise)
+
+The Copilot API host is **not** a constant. It is encoded in the access
+token's `proxy-ep` field and differs per tenant:
+
+- Individual plans:  `api.individual.githubcopilot.com`
+- Business/Enterprise (logged in via github.com): `api.enterprise.githubcopilot.com`
+- GHE (logged in via a GHE domain): a GHE-specific host
+
+Always derive it from the live token via `resolveCopilotBaseUrl()`
+(`src/models.ts`), which wraps pi-ai's `getGitHubCopilotBaseUrl()`.
+
+This was the cause of the long-standing "401 / IDE token expired" (and
+`421 Misdirected Request`) reports from enterprise users: the extension
+registered a hardcoded `baseUrl: "https://api.individual.githubcopilot.com"`
+and relied on `oauth.modifyModels` to rewrite it. But the **override-only**
+registration path in pi's model-registry (`registerProvider()` with no
+`models`) sets `baseUrl` directly and does NOT run `modifyModels`, and the
+"model not found → custom id" fallback uses the provider default baseUrl.
+Both left enterprise tenants pinned to the individual host → the proxy
+rejected every request. Vanilla pi never hit this because its built-in
+provider always derives the host from the token.
+
+`src/index.ts` now seeds `providerBaseUrl` from the stored token before the
+first `registerProvider()` and updates it on every refresh, so all
+registration paths use the tenant's real host. `modifyModels` still refines
+it per request.
+
+### `thinkingLevelMap` must match what the model actually supports
+
+`families.ts` must not advertise a reasoning tier the model lacks. Base
+`gpt-5` / `gpt-5-mini` do NOT support `xhigh`; only `gpt-5.2+` do. Sending
+`xhigh` to a model without it yields `400 Unsupported value: 'xhigh'`.
+Mirror pi-ai's `github-copilot.models.js` per-family maps.
+
 ### `PROVIDER_NAME` must stay `"github-copilot"`
 
 The whole point of this extension is to override pi-ai's built-in.

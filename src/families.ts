@@ -34,6 +34,15 @@ export type ApiFamily = {
 const OPENAI_RESPONSES_THINKING: ThinkingLevelMap = {
 	off: null,
 	minimal: "low",
+};
+
+// gpt-5.2 and newer (incl. codex / mini / nano variants) expose an extra
+// "xhigh" reasoning tier; base gpt-5 and gpt-5-mini do NOT. Advertising
+// xhigh for a model that lacks it makes the proxy reject requests with
+// 400 "Unsupported value: 'xhigh'". Mirror pi-ai's built-in catalog.
+const OPENAI_RESPONSES_THINKING_XHIGH: ThinkingLevelMap = {
+	off: null,
+	minimal: "low",
 	xhigh: "xhigh",
 };
 
@@ -74,10 +83,13 @@ export function classify(familyOrId: string): ApiFamily {
 
 	// ---- OpenAI reasoning families (Responses API) ----
 	if (/^(gpt-5|o1|o3)/.test(s)) {
+		const supportsXhigh = /gpt-5\.(?:[2-9]|\d\d)/.test(s);
 		return {
 			api: "openai-responses",
 			reasoning: true,
-			thinkingLevelMap: OPENAI_RESPONSES_THINKING,
+			thinkingLevelMap: supportsXhigh
+				? OPENAI_RESPONSES_THINKING_XHIGH
+				: OPENAI_RESPONSES_THINKING,
 		};
 	}
 

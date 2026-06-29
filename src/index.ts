@@ -21,7 +21,7 @@ import {
 	createCopilotDiscoveryOAuth,
 	type CopilotCredentials,
 } from "./oauth.ts";
-import { fetchCopilotModels, toProviderModels } from "./models.ts";
+import { fetchCopilotModels, resolveCopilotBaseUrl, toProviderModels } from "./models.ts";
 import { streamCopilotDiscovery } from "./stream.ts";
 
 const PROVIDER_NAME = "github-copilot";
@@ -64,9 +64,15 @@ async function readStoredCredentials(): Promise<CopilotCredentials | null> {
 	return null;
 }
 
-const STATIC_PROVIDER_BASE: Omit<ProviderConfig, "models" | "oauth"> = {
+// Last-resort default ONLY when we have no token to derive the real host
+// from. The correct host (individual vs. enterprise/GHE) is encoded in the
+// Copilot token's `proxy-ep`; see resolveCopilotBaseUrl. Never send real
+// traffic to this constant for an enterprise tenant — the proxy rejects it
+// with 421 / "401 IDE token expired".
+const DEFAULT_BASE_URL = "https://api.individual.githubcopilot.com";
+
+const STATIC_PROVIDER_BASE: Omit<ProviderConfig, "models" | "oauth" | "baseUrl"> = {
 	name: "GitHub Copilot",
-	baseUrl: "https://api.individual.githubcopilot.com",
 	authHeader: true,
 	api: "openai-completions",
 	headers: {
@@ -80,6 +86,20 @@ const STATIC_PROVIDER_BASE: Omit<ProviderConfig, "models" | "oauth"> = {
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	let models: ProviderConfig["models"] = [];
+
+	// Provider baseUrl derived from the live token. Defaults only matter
+	// until we see a token; after that it tracks the tenant's real proxy.
+	let providerBaseUrl = DEFAULT_BASE_URL;
+
+	const setBaseUrlFromCreds = (creds: CopilotCredentials | null | undefined): void => {
+		if (creds?.access) {
+			try {
+				providerBaseUrl = resolveCopilotBaseUrl(creds.access, creds.enterpriseUrl);
+			} catch {
+				/* keep previous baseUrl */
+			}
+		}
+	};
 
 	let runRefresh: (
 		reason: RefreshReason,
@@ -99,16 +119,34 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	const registerProvider = (nextModels?: ProviderConfig["models"]): void => {
+		const base = { ...STATIC_PROVIDER_BASE, baseUrl: providerBaseUrl, oauth };
 		if (nextModels) {
-			pi.registerProvider(PROVIDER_NAME, {
-				...STATIC_PROVIDER_BASE,
-				oauth,
-				models: nextModels,
-			});
+			pi.registerProvider(PROVIDER_NAME, { ...base, models: nextModels });
 			return;
 		}
 		// Override-only mode: keep built-in static catalog; replace oauth + streamSimple.
-		pi.registerProvider(PROVIDER_NAME, { ...STATIC_PROVIDER_BASE, oauth });
+		pi.registerProvider(PROVIDER_NAME, base);
+	};
+
+	// Discover models, transparently refreshing a stale stored token ONCE
+	// (in memory, delegated to pi-ai's built-in refresh — never written to
+	// auth.json; pi owns persistence). Without this, reopening pi after the
+	// short-lived Copilot token expired would silently drop the tenant
+	// catalog until the next manual /copilot-refresh.
+	const fetchWithStaleTokenRetry = async (
+		credentials: CopilotCredentials,
+	): Promise<Awaited<ReturnType<typeof fetchCopilotModels>>> => {
+		try {
+			return await fetchCopilotModels(credentials.access, credentials.enterpriseUrl);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!/\b401\b/.test(msg) || typeof credentials.refresh !== "string") {
+				throw err;
+			}
+			const refreshed = (await oauth.refreshToken(credentials)) as CopilotCredentials;
+			setBaseUrlFromCreds(refreshed);
+			return await fetchCopilotModels(refreshed.access, refreshed.enterpriseUrl);
+		}
 	};
 
 	runRefresh = async (reason, credentialsOverride) => {
@@ -116,8 +154,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (!credentials?.access) {
 			return { ok: false, error: "not logged in" };
 		}
+		// Point the provider at the tenant's real proxy BEFORE registering, so
+		// neither the override-only nor the with-models registration leaves an
+		// enterprise tenant pinned to the individual host.
+		setBaseUrlFromCreds(credentials);
 		try {
-			const raw = await fetchCopilotModels(credentials.access, credentials.enterpriseUrl);
+			const raw = await fetchWithStaleTokenRetry(credentials);
 			const next = toProviderModels(raw);
 			if (next.length === 0) {
 				return { ok: false, error: "discovery returned no models" };
@@ -127,7 +169,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return { ok: true, count: next.length };
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			// Never downgrade an already-loaded live catalog.
+			// Never downgrade an already-loaded live catalog, but DO re-register
+			// the override so the corrected baseUrl takes effect.
 			if (models.length === 0) {
 				registerProvider();
 			}
@@ -138,12 +181,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 	};
 
+	// Seed the baseUrl from any stored token BEFORE the first registration so
+	// the override-only catalog routes to the correct (possibly enterprise)
+	// host even before discovery completes.
+	const startupCreds = await readStoredCredentials();
+	setBaseUrlFromCreds(startupCreds);
+
 	// Register override immediately so login/stream behavior is active even
-	// before discovery completes.
+	// before discovery completes (with the correct, token-derived baseUrl).
 	registerProvider();
 
-	// One async discovery on startup; no retries/timers.
-	void runRefresh("startup");
+	// Await the initial discovery so the model catalog is registered before
+	// the first turn. This makes model resolution deterministic (no "model
+	// not found, using custom id" fallback to a default host) and avoids
+	// registering on a torn-down session. fetchCopilotModels has a 10s
+	// timeout, and a missing/failed discovery still leaves the override-only
+	// provider registered, so this can't hang startup indefinitely.
+	await runRefresh("startup", startupCreds ?? undefined);
 
 	const refreshHandler = async (
 		_args: unknown,

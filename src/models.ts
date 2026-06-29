@@ -49,7 +49,18 @@ export type CopilotModel = {
 	policy?: { state?: "enabled" | "disabled" | "unconfigured" };
 };
 
-function resolveBaseUrl(token: string, enterpriseUrl?: string): string {
+/**
+ * Resolve the correct Copilot API base URL for a given token.
+ *
+ * CRITICAL: the host is encoded in the token's `proxy-ep` field, NOT a
+ * constant. Individual plans use `api.individual.githubcopilot.com`;
+ * business/enterprise tenants use `api.enterprise.githubcopilot.com` (or
+ * a GHE-specific host). Hardcoding `api.individual...` sends enterprise
+ * tokens to the wrong proxy — the server then rejects with `421 Misdirected
+ * Request` or a misleading `401 ... IDE token expired`. Always derive the
+ * base URL from the live token.
+ */
+export function resolveCopilotBaseUrl(token: string, enterpriseUrl?: string): string {
 	const domain = enterpriseUrl ? (normalizeDomain(enterpriseUrl) ?? undefined) : undefined;
 	return getGitHubCopilotBaseUrl(token, domain);
 }
@@ -58,13 +69,15 @@ export async function fetchCopilotModels(
 	copilotToken: string,
 	enterpriseUrl?: string,
 ): Promise<CopilotModel[]> {
-	const baseUrl = resolveBaseUrl(copilotToken, enterpriseUrl);
+	const baseUrl = resolveCopilotBaseUrl(copilotToken, enterpriseUrl);
 	const res = await fetch(`${baseUrl}/models`, {
 		headers: {
 			Authorization: `Bearer ${copilotToken}`,
 			Accept: "application/json",
 			...COPILOT_HEADERS,
 		},
+		// Never let a slow/hung discovery block pi startup indefinitely.
+		signal: AbortSignal.timeout(10000),
 	});
 	if (!res.ok) {
 		throw new Error(`copilot /models: ${res.status} ${await res.text()}`);
