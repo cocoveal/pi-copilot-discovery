@@ -1,30 +1,18 @@
-/**
- * Fetch and normalize the Copilot tenant's model catalog.
- *
- * The Copilot `/models` endpoint is the source of truth for what the
- * signed-in account is entitled to — including preview / tenant-private
- * models that don't appear in any static pi-ai list.
- *
- * Returned `ProviderModelConfig` entries carry per-model `api` overrides
- * so a single `copilot-msft` provider can host Anthropic, OpenAI
- * Responses, and OpenAI Completions backed models in one list.
- */
+/** Fetch and normalize the live GitHub Copilot model catalog. */
 
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { getGitHubCopilotBaseUrl, normalizeDomain } from "@earendil-works/pi-ai/oauth";
+import type { Api, Credential, Model, Provider } from "@earendil-works/pi-ai";
 import { classify } from "./families.ts";
 
-/**
- * Static Copilot client identification headers.
- * Kept in sync with pi-ai's built-in github-copilot provider
- * (`COPILOT_HEADERS` in pi-ai/src/utils/oauth/github-copilot.ts).
- * Bump together when pi-ai bumps.
- */
+const PROVIDER_NAME = "github-copilot";
+const DEFAULT_BASE_URL = "https://api.individual.githubcopilot.com";
+
+/** Static client headers mirrored from pi-ai's GitHub Copilot OAuth flow. */
 export const COPILOT_HEADERS = {
 	"User-Agent": "GitHubCopilotChat/0.35.0",
 	"Editor-Version": "vscode/1.107.0",
 	"Editor-Plugin-Version": "copilot-chat/0.35.0",
 	"Copilot-Integration-Id": "vscode-chat",
+	"X-GitHub-Api-Version": "2026-06-01",
 } as const;
 
 export type CopilotModel = {
@@ -33,7 +21,6 @@ export type CopilotModel = {
 	capabilities?: {
 		type?: string;
 		family?: string;
-		tokenizer?: string;
 		limits?: {
 			max_context_window_tokens?: number;
 			max_output_tokens?: number;
@@ -49,63 +36,78 @@ export type CopilotModel = {
 	policy?: { state?: "enabled" | "disabled" | "unconfigured" };
 };
 
-/**
- * Resolve the correct Copilot API base URL for a given token.
- *
- * CRITICAL: the host is encoded in the token's `proxy-ep` field, NOT a
- * constant. Individual plans use `api.individual.githubcopilot.com`;
- * business/enterprise tenants use `api.enterprise.githubcopilot.com` (or
- * a GHE-specific host). Hardcoding `api.individual...` sends enterprise
- * tokens to the wrong proxy — the server then rejects with `421 Misdirected
- * Request` or a misleading `401 ... IDE token expired`. Always derive the
- * base URL from the live token.
- */
-export function resolveCopilotBaseUrl(token: string, enterpriseUrl?: string): string {
-	const domain = enterpriseUrl ? (normalizeDomain(enterpriseUrl) ?? undefined) : undefined;
-	return getGitHubCopilotBaseUrl(token, domain);
+function baseUrlFromToken(token: string): string | undefined {
+	const proxyHost = token.match(/(?:^|;)proxy-ep=([^;]+)/)?.[1];
+	return proxyHost ? `https://${proxyHost.replace(/^proxy\./, "api.")}` : undefined;
+}
+
+export async function resolveCopilotBaseUrl(
+	provider: Provider,
+	credential: Credential | undefined,
+	token: string,
+): Promise<string> {
+	if (credential?.type === "oauth" && provider.auth.oauth) {
+		const auth = await provider.auth.oauth.toAuth(credential);
+		if (auth.baseUrl) return auth.baseUrl;
+	}
+	return baseUrlFromToken(token) ?? provider.baseUrl ?? DEFAULT_BASE_URL;
+}
+
+function isCopilotModel(value: unknown): value is CopilotModel {
+	if (!value || typeof value !== "object") return false;
+	const model = value as Record<string, unknown>;
+	return typeof model.id === "string" && model.id.length > 0;
 }
 
 export async function fetchCopilotModels(
 	copilotToken: string,
-	enterpriseUrl?: string,
+	baseUrl: string,
+	signal?: AbortSignal,
 ): Promise<CopilotModel[]> {
-	const baseUrl = resolveCopilotBaseUrl(copilotToken, enterpriseUrl);
-	const res = await fetch(`${baseUrl}/models`, {
+	const timeoutSignal = AbortSignal.timeout(10000);
+	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const response = await fetch(`${baseUrl}/models`, {
 		headers: {
 			Authorization: `Bearer ${copilotToken}`,
 			Accept: "application/json",
 			...COPILOT_HEADERS,
 		},
-		// Never let a slow/hung discovery block pi startup indefinitely.
-		signal: AbortSignal.timeout(10000),
+		signal: requestSignal,
 	});
-	if (!res.ok) {
-		throw new Error(`copilot /models: ${res.status} ${await res.text()}`);
+	if (!response.ok) {
+		throw new Error(`copilot /models: ${response.status} ${await response.text()}`);
 	}
-	const body = (await res.json()) as { data: CopilotModel[] };
-	return body.data.filter(
-		(m) => m.model_picker_enabled !== false && m.capabilities?.type === "chat",
+
+	const body = (await response.json()) as { data?: unknown };
+	if (!Array.isArray(body.data)) {
+		throw new Error("copilot /models: invalid response");
+	}
+	return body.data.filter(isCopilotModel).filter(
+		(model) =>
+			model.model_picker_enabled !== false &&
+			model.capabilities?.type === "chat" &&
+			model.capabilities.supports?.tool_calls !== false,
 	);
 }
 
-export function toProviderModels(models: CopilotModel[]): ProviderModelConfig[] {
-	// Some tenants return multiple entries with the same `id` (e.g. a
-	// model and a vision variant). Keep the first by id so /model is sane.
+export function toProviderModels(models: CopilotModel[], baseUrl: string): Model<Api>[] {
 	const seen = new Set<string>();
-	const out: ProviderModelConfig[] = [];
-	for (const m of models) {
-		if (seen.has(m.id)) continue;
-		seen.add(m.id);
+	const output: Model<Api>[] = [];
+	for (const model of models) {
+		if (seen.has(model.id)) continue;
+		seen.add(model.id);
 
-		const familyOrId = m.capabilities?.family ?? m.id;
+		const familyOrId = model.capabilities?.family ?? model.id;
 		const { api, reasoning, thinkingLevelMap, compat } = classify(familyOrId);
-		const vision = m.capabilities?.supports?.vision === true;
-		const limits = m.capabilities?.limits ?? {};
+		const vision = model.capabilities?.supports?.vision === true;
+		const limits = model.capabilities?.limits ?? {};
 
-		out.push({
-			id: m.id,
-			name: m.name ?? m.id,
+		output.push({
+			id: model.id,
+			name: model.name ?? model.id,
 			api,
+			provider: PROVIDER_NAME,
+			baseUrl,
 			reasoning,
 			thinkingLevelMap,
 			compat,
@@ -113,9 +115,9 @@ export function toProviderModels(models: CopilotModel[]): ProviderModelConfig[] 
 			contextWindow:
 				limits.max_context_window_tokens ?? limits.max_prompt_tokens ?? 128000,
 			maxTokens: limits.max_output_tokens ?? 16384,
-			// Copilot is a flat-fee subscription; per-token cost is meaningless.
+			headers: { ...COPILOT_HEADERS },
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 	}
-	return out;
+	return output;
 }

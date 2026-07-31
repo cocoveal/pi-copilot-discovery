@@ -1,230 +1,119 @@
 /**
- * pi-copilot-discovery — dynamic GitHub Copilot provider for pi.
+ * pi-copilot-discovery — dynamic GitHub Copilot model discovery for pi.
  *
- * Simplified discovery model:
- *   - Register provider override immediately (without `models`) so pi's
- *     built-in static github-copilot catalog remains usable.
- *   - Run one best-effort `/models` discovery on startup (async).
- *   - Run one discovery immediately after successful `/login`.
- *   - Expose `/copilot-refresh` for manual re-discovery.
- *
- * Token refresh/persistence remains owned by pi's OAuth/auth-storage path.
+ * Pi 0.83 owns the built-in provider's auth, token refresh, request base URL,
+ * headers, and streaming. Once a session starts, this extension wraps that
+ * effective provider and replaces only its model catalog with live /models data.
  */
 
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import type {
+	Api,
+	Credential,
+	Model,
+	Provider,
+	RefreshModelsContext,
+} from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 
-import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
-
-import {
-	createCopilotDiscoveryOAuth,
-	type CopilotCredentials,
-} from "./oauth.ts";
 import { fetchCopilotModels, resolveCopilotBaseUrl, toProviderModels } from "./models.ts";
-import { streamCopilotDiscovery } from "./stream.ts";
+import { wrapCopilotOAuth } from "./oauth.ts";
 
 const PROVIDER_NAME = "github-copilot";
-
-type RefreshReason = "startup" | "login" | "command";
 type RefreshResult = { ok: true; count: number } | { ok: false; error: string };
 
-// Same logic as pi-coding-agent's `getAgentDir()` so we read the same
-// auth.json pi writes (including PI_CODING_AGENT_DIR overrides).
-function getAuthPath(): string {
-	const envDir = process.env.PI_CODING_AGENT_DIR;
-	const base = envDir
-		? envDir.replace(/^~(\/|$)/, `${homedir()}$1`)
-		: join(homedir(), ".pi", "agent");
-	return join(base, "auth.json");
+function credentialToken(credential: Credential | undefined): string | undefined {
+	if (credential?.type === "oauth") return credential.access;
+	return credential?.key;
 }
 
-type StoredCredential = CopilotCredentials & { type?: string };
-
-async function readStoredCredentials(): Promise<CopilotCredentials | null> {
-	try {
-		const buf = await readFile(getAuthPath(), "utf8");
-		const json = JSON.parse(buf) as Record<string, unknown>;
-		const entry = json[PROVIDER_NAME];
-		if (
-			entry &&
-			typeof entry === "object" &&
-			"access" in entry &&
-			typeof (entry as StoredCredential).access === "string"
-		) {
-			return entry as CopilotCredentials;
-		}
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-			console.error(
-				`pi-copilot-discovery: could not read auth.json (${err instanceof Error ? err.message : String(err)})`,
-			);
-		}
+function notifyRefreshResult(result: RefreshResult, ctx: ExtensionCommandContext): void {
+	if (result.ok) {
+		ctx.ui.notify(`pi-copilot-discovery: refreshed ${result.count} models`, "info");
+	} else {
+		ctx.ui.notify(`pi-copilot-discovery refresh failed: ${result.error}`, "error");
 	}
-	return null;
 }
 
-// Last-resort default ONLY when we have no token to derive the real host
-// from. The correct host (individual vs. enterprise/GHE) is encoded in the
-// Copilot token's `proxy-ep`; see resolveCopilotBaseUrl. Never send real
-// traffic to this constant for an enterprise tenant — the proxy rejects it
-// with 421 / "401 IDE token expired".
-const DEFAULT_BASE_URL = "https://api.individual.githubcopilot.com";
+function createDiscoveryProvider(
+	builtin: Provider,
+	onRefresh: (result: RefreshResult) => void,
+): Provider {
+	let models: readonly Model<Api>[] = builtin.getModels();
 
-const STATIC_PROVIDER_BASE: Omit<ProviderConfig, "models" | "oauth" | "baseUrl"> = {
-	name: "GitHub Copilot",
-	authHeader: true,
-	api: "openai-completions",
-	headers: {
-		"User-Agent": "GitHubCopilotChat/0.35.0",
-		"Editor-Version": "vscode/1.107.0",
-		"Editor-Plugin-Version": "copilot-chat/0.35.0",
-		"Copilot-Integration-Id": "vscode-chat",
-	},
-	streamSimple: streamCopilotDiscovery,
-};
+	const refreshModels = async (context: RefreshModelsContext): Promise<void> => {
+		if (!context.allowNetwork || context.signal?.aborted) return;
 
-export default async function (pi: ExtensionAPI): Promise<void> {
-	let models: ProviderConfig["models"] = [];
+		const token = credentialToken(context.credential);
+		if (!token) return;
 
-	// Provider baseUrl derived from the live token. Defaults only matter
-	// until we see a token; after that it tracks the tenant's real proxy.
-	let providerBaseUrl = DEFAULT_BASE_URL;
-
-	const setBaseUrlFromCreds = (creds: CopilotCredentials | null | undefined): void => {
-		if (creds?.access) {
-			try {
-				providerBaseUrl = resolveCopilotBaseUrl(creds.access, creds.enterpriseUrl);
-			} catch {
-				/* keep previous baseUrl */
+		try {
+			const baseUrl = await resolveCopilotBaseUrl(builtin, context.credential, token);
+			const raw = await fetchCopilotModels(token, baseUrl, context.signal);
+			const discovered = toProviderModels(raw, baseUrl);
+			if (discovered.length === 0) {
+				onRefresh({ ok: false, error: "discovery returned no models" });
+				return;
 			}
+			models = discovered;
+			onRefresh({ ok: true, count: discovered.length });
+		} catch (error) {
+			onRefresh({
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
-	let runRefresh: (
-		reason: RefreshReason,
-		credentialsOverride?: CopilotCredentials,
-	) => Promise<RefreshResult>;
+	return {
+		...builtin,
+		auth: builtin.auth.oauth
+			? { ...builtin.auth, oauth: wrapCopilotOAuth(builtin.auth.oauth) }
+			: builtin.auth,
+		getModels: () => models,
+		refreshModels,
+		// The live catalog is already credential-specific. The built-in filter
+		// projects a static catalog and would remove models unknown to that list.
+		filterModels: (available) => available,
+	};
+}
 
-	const oauth = createCopilotDiscoveryOAuth({
-		onLogin: async (credentials, onProgress) => {
-			onProgress?.("Refreshing Copilot model catalog...");
-			const result = await runRefresh("login", credentials);
-			if (result.ok) {
-				onProgress?.(`Loaded ${result.count} Copilot models`);
-			} else {
-				onProgress?.(`Model discovery after login failed: ${result.error}`);
+export default function (pi: ExtensionAPI): void {
+	const refreshState: { last: RefreshResult } = {
+		last: { ok: false, error: "not logged in" },
+	};
+	let registered = false;
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (!registered) {
+			const builtin = ctx.modelRegistry.getProvider(PROVIDER_NAME);
+			if (!builtin) {
+				refreshState.last = { ok: false, error: "built-in provider not found" };
+				return;
 			}
-		},
+			pi.registerProvider(
+				createDiscoveryProvider(builtin, (result) => {
+					refreshState.last = result;
+				}),
+			);
+			registered = true;
+		}
+		await ctx.modelRegistry.refresh();
 	});
 
-	const registerProvider = (nextModels?: ProviderConfig["models"]): void => {
-		const base = { ...STATIC_PROVIDER_BASE, baseUrl: providerBaseUrl, oauth };
-		if (nextModels) {
-			pi.registerProvider(PROVIDER_NAME, { ...base, models: nextModels });
-			return;
-		}
-		// Override-only mode: keep built-in static catalog; replace oauth + streamSimple.
-		pi.registerProvider(PROVIDER_NAME, base);
-	};
-
-	// Discover models, transparently refreshing a stale stored token ONCE
-	// (in memory, delegated to pi-ai's built-in refresh — never written to
-	// auth.json; pi owns persistence). Without this, reopening pi after the
-	// short-lived Copilot token expired would silently drop the tenant
-	// catalog until the next manual /copilot-refresh.
-	const fetchWithStaleTokenRetry = async (
-		credentials: CopilotCredentials,
-	): Promise<Awaited<ReturnType<typeof fetchCopilotModels>>> => {
-		try {
-			return await fetchCopilotModels(credentials.access, credentials.enterpriseUrl);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (!/\b401\b/.test(msg) || typeof credentials.refresh !== "string") {
-				throw err;
-			}
-			const refreshed = (await oauth.refreshToken(credentials)) as CopilotCredentials;
-			setBaseUrlFromCreds(refreshed);
-			return await fetchCopilotModels(refreshed.access, refreshed.enterpriseUrl);
-		}
-	};
-
-	runRefresh = async (reason, credentialsOverride) => {
-		const credentials = credentialsOverride ?? (await readStoredCredentials());
-		if (!credentials?.access) {
-			return { ok: false, error: "not logged in" };
-		}
-		// Point the provider at the tenant's real proxy BEFORE registering, so
-		// neither the override-only nor the with-models registration leaves an
-		// enterprise tenant pinned to the individual host.
-		setBaseUrlFromCreds(credentials);
-		try {
-			const raw = await fetchWithStaleTokenRetry(credentials);
-			const next = toProviderModels(raw);
-			if (next.length === 0) {
-				return { ok: false, error: "discovery returned no models" };
-			}
-			models = next;
-			registerProvider(models);
-			return { ok: true, count: next.length };
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			// Never downgrade an already-loaded live catalog, but DO re-register
-			// the override so the corrected baseUrl takes effect.
-			if (models.length === 0) {
-				registerProvider();
-			}
-			if (reason !== "command") {
-				console.error(`pi-copilot-discovery: ${reason} discovery failed (${msg})`);
-			}
-			return { ok: false, error: msg };
-		}
-	};
-
-	// Seed the baseUrl from any stored token BEFORE the first registration so
-	// the override-only catalog routes to the correct (possibly enterprise)
-	// host even before discovery completes.
-	const startupCreds = await readStoredCredentials();
-	setBaseUrlFromCreds(startupCreds);
-
-	// Register override immediately so login/stream behavior is active even
-	// before discovery completes (with the correct, token-derived baseUrl).
-	registerProvider();
-
-	// Await the initial discovery so the model catalog is registered before
-	// the first turn. This makes model resolution deterministic (no "model
-	// not found, using custom id" fallback to a default host) and avoids
-	// registering on a torn-down session. fetchCopilotModels has a 10s
-	// timeout, and a missing/failed discovery still leaves the override-only
-	// provider registered, so this can't hang startup indefinitely.
-	await runRefresh("startup", startupCreds ?? undefined);
-
 	const refreshHandler = async (
-		_args: unknown,
-		ctx: { ui: { notify: (msg: string, level: "info" | "warning" | "error") => void } },
+		_args: string,
+		ctx: ExtensionCommandContext,
 	): Promise<void> => {
-		const result = await runRefresh("command");
-		if (result.ok) {
-			ctx.ui.notify(`pi-copilot-discovery: refreshed ${result.count} models`, "info");
-		} else if (result.error === "not logged in") {
-			ctx.ui.notify(
-				"pi-copilot-discovery: not logged in. Run /login github-copilot.",
-				"warning",
-			);
-		} else {
-			ctx.ui.notify(`pi-copilot-discovery refresh failed: ${result.error}`, "error");
-		}
+		refreshState.last = { ok: false, error: "not logged in" };
+		await ctx.modelRegistry.refresh();
+		notifyRefreshResult(refreshState.last, ctx);
 	};
 
 	pi.registerCommand("copilot-refresh", {
 		description: "Re-fetch the GitHub Copilot model catalog from /models",
-		// biome-ignore lint/suspicious/noExplicitAny: ExtensionAPI command ctx is loosely typed.
-		handler: refreshHandler as any,
-	});
-
-	pi.registerCommand("copilot-discovery-refresh", {
-		description: "Alias of /copilot-refresh (back-compat)",
-		// biome-ignore lint/suspicious/noExplicitAny: ExtensionAPI command ctx is loosely typed.
-		handler: refreshHandler as any,
+		handler: refreshHandler,
 	});
 }
