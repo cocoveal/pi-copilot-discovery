@@ -30,8 +30,11 @@ export type CopilotModel = {
 			vision?: boolean;
 			tool_calls?: boolean;
 			streaming?: boolean;
+			reasoning_effort?: string[];
 		};
 	};
+	/** Proxy paths this model accepts, e.g. ["/responses"] or ["/chat/completions"]. */
+	supported_endpoints?: string[];
 	model_picker_enabled?: boolean;
 	policy?: { state?: "enabled" | "disabled" | "unconfigured" };
 };
@@ -98,7 +101,10 @@ export function toProviderModels(models: CopilotModel[], baseUrl: string): Model
 		seen.add(model.id);
 
 		const familyOrId = model.capabilities?.family ?? model.id;
-		const { api, reasoning, thinkingLevelMap, compat } = classify(familyOrId);
+		const { api, reasoning, thinkingLevelMap, compat } = classify(familyOrId, {
+			supportedEndpoints: model.supported_endpoints,
+			reasoningEffort: model.capabilities?.supports?.reasoning_effort,
+		});
 		const vision = model.capabilities?.supports?.vision === true;
 		const limits = model.capabilities?.limits ?? {};
 

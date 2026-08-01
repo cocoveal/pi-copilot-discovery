@@ -126,9 +126,12 @@ by ID before publishing.
 
 ### Keep family routing conservative
 
+Prefer Copilot `supported_endpoints` when a model is responses-only
+(`/responses` without `/chat/completions`). Otherwise:
+
 - Claude → `anthropic-messages`
 - GPT-5/o1/o3 → `openai-responses`
-- Gemini/Grok/unknown → `openai-completions`
+- Gemini/unknown chat-completions models → `openai-completions`
 
 Only advertise reasoning tiers supported by the model family. A wrong tier can
 cause `400 Unsupported value` responses.
