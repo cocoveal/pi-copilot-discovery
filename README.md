@@ -29,8 +29,9 @@ waiting for another Pi release.
 - **Enables tenant policies after login.** The wrapped built-in OAuth login runs
   `POST /models/<id>/policy {"state":"enabled"}` for every discovered model.
 - **Classifies unknown models conservatively.** Claude uses Anthropic Messages,
-  GPT-5/o1/o3 use OpenAI Responses, and unknown/Gemini/Grok families use OpenAI
-  Chat Completions.
+  GPT-5/o1/o3 use OpenAI Responses, responses-only models (for example Grok 4.5)
+  use OpenAI Responses from `supported_endpoints`, and remaining chat models use
+  OpenAI Chat Completions.
 
 ## Install
 
@@ -92,12 +93,18 @@ by the proxy.
 
 ### Family → API routing
 
-| Model family pattern | Pi API | Reasoning |
+| Model family / endpoint signal | Pi API | Reasoning |
 | --- | --- | --- |
 | `claude-*` (3.5+, 4.x, 5.x) | `anthropic-messages` | yes |
 | `claude-2.x`, `claude-3` (3.0–3.4) | `anthropic-messages` | no |
 | `gpt-5*`, `o1`, `o3` | `openai-responses` | yes |
-| `gpt-4*`, `gemini-*`, `grok-*`, other | `openai-completions` | no |
+| responses-only (`supported_endpoints: ["/responses"]`) | `openai-responses` | if advertised |
+| `gpt-4*`, `gemini-*`, other chat-completions | `openai-completions` | no |
+
+`supported_endpoints` wins for responses-only models such as `grok-4.5` and
+`mai-code-1-flash-picker`. Routing those to `/chat/completions` yields
+`unsupported_api_for_model`. Name heuristics still classify Claude and GPT-5
+families when endpoints are absent or include multiple paths.
 
 The heuristics in `src/families.ts` intentionally choose the safest known API
 for an unfamiliar family.
@@ -110,7 +117,8 @@ for an unfamiliar family.
 | Only Pi's bundled models appear | Live refresh failed or the extension did not load | Run `/copilot-refresh` and inspect the notification |
 | A preview model returns 403 | Its tenant policy was not enabled | Re-run `/login github-copilot` |
 | Proxy rejects `Editor-Version` or `User-Agent` | Pi changed its Copilot client headers | Update `COPILOT_HEADERS` in `src/models.ts` |
-| A new family is misrouted | Conservative fallback selected `openai-completions` | Refine `src/families.ts` using the returned family/id |
+| `unsupported_api_for_model` on `/chat/completions` | Model is responses-only (`supported_endpoints: ["/responses"]`) | Ensure discovery reads `supported_endpoints`; update if needed |
+| A new family is misrouted | Conservative fallback selected `openai-completions` | Refine `src/families.ts` using the returned family/id/endpoints |
 
 ## Requirements
 

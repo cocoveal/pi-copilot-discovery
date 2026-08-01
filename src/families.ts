@@ -1,9 +1,14 @@
 /**
  * Classify a Copilot model into the right pi-ai api family.
  *
- * Heuristics derived from pi-ai's own static `github-copilot` model table
- * (`node_modules/@earendil-works/pi-ai/dist/models.generated.js`) so this
- * routes the same way pi-ai routes its built-in Copilot models:
+ * Prefer Copilot's live `supported_endpoints` when present. That field is the
+ * source of truth for which proxy path the tenant will accept — for example
+ * `grok-4.5` and `mai-code-1-flash-picker` advertise only `/responses`, and
+ * calling `/chat/completions` returns:
+ *   400 unsupported_api_for_model
+ *
+ * Name heuristics (aligned with pi-ai's static github-copilot catalog) remain
+ * the fallback when endpoints are missing or ambiguous:
  *
  *   - claude-*   → anthropic-messages   (reasoning where supported)
  *   - gpt-5*     → openai-responses     (reasoning)
@@ -12,8 +17,7 @@
  *   - gemini-*   → openai-completions   (Copilot proxies Gemini through
  *                                        an OpenAI-compatible endpoint;
  *                                        DO NOT route to google-generative-ai)
- *   - grok-*     → openai-completions
- *   - default    → openai-completions   (safe, widely supported)
+ *   - default    → openai-completions   (safe when /chat/completions works)
  *
  * Heuristics are intentionally conservative — when uncertain we choose
  * an api the model is *usable* under even if it is not optimal.
@@ -31,6 +35,11 @@ export type ApiFamily = {
 	compat?: Compat;
 };
 
+export type ClassifyOptions = {
+	supportedEndpoints?: readonly string[];
+	reasoningEffort?: readonly string[];
+};
+
 const OPENAI_RESPONSES_THINKING: ThinkingLevelMap = {
 	off: null,
 	minimal: "low",
@@ -46,7 +55,53 @@ const OPENAI_RESPONSES_THINKING_XHIGH: ThinkingLevelMap = {
 	xhigh: "xhigh",
 };
 
-export function classify(familyOrId: string): ApiFamily {
+function normalizeEndpoints(endpoints: readonly string[] | undefined): Set<string> {
+	const out = new Set<string>();
+	for (const endpoint of endpoints ?? []) {
+		let path = endpoint.trim();
+		if (!path) continue;
+		// Copilot returns both "/responses" and occasional "ws:/responses".
+		if (path.startsWith("ws:")) path = path.slice(3);
+		if (!path.startsWith("/")) path = `/${path}`;
+		out.add(path);
+	}
+	return out;
+}
+
+function responsesThinkingMap(reasoningEffort: readonly string[] | undefined): ThinkingLevelMap {
+	const efforts = new Set((reasoningEffort ?? []).map((e) => e.toLowerCase()));
+	if (efforts.size === 0) return { ...OPENAI_RESPONSES_THINKING };
+
+	const map: ThinkingLevelMap = { ...OPENAI_RESPONSES_THINKING };
+	if (efforts.has("xhigh")) map.xhigh = "xhigh";
+	if (efforts.has("max")) map.max = "max";
+	return map;
+}
+
+function classifyByEndpoints(options: ClassifyOptions): ApiFamily | undefined {
+	const endpoints = normalizeEndpoints(options.supportedEndpoints);
+	if (endpoints.size === 0) return undefined;
+
+	const hasMessages = endpoints.has("/v1/messages");
+	const hasResponses = endpoints.has("/responses");
+	const hasChatCompletions = endpoints.has("/chat/completions");
+
+	// Responses-only models (grok-4.5, mai-code-1-flash-picker, many gpt-5*)
+	// must not fall through to openai-completions.
+	if (hasResponses && !hasChatCompletions && !hasMessages) {
+		const efforts = options.reasoningEffort ?? [];
+		return {
+			api: "openai-responses",
+			reasoning: efforts.length > 0,
+			thinkingLevelMap: efforts.length > 0 ? responsesThinkingMap(efforts) : undefined,
+		};
+	}
+
+	return undefined;
+}
+
+export function classify(familyOrId: string, options: ClassifyOptions = {}): ApiFamily {
+	const fromEndpoints = classifyByEndpoints(options);
 	const s = familyOrId.toLowerCase();
 
 	// ---- Claude (Anthropic Messages API) ----
@@ -93,11 +148,22 @@ export function classify(familyOrId: string): ApiFamily {
 		};
 	}
 
+	// Copilot serves current Grok chat models on /responses only. Keep this
+	// name fallback for catalogs that omit supported_endpoints.
+	if (s.startsWith("grok")) {
+		return {
+			api: "openai-responses",
+			reasoning: true,
+			thinkingLevelMap: responsesThinkingMap(options.reasoningEffort),
+		};
+	}
+
+	if (fromEndpoints) return fromEndpoints;
+
 	// ---- Everything else → OpenAI Chat Completions (no reasoning) ----
 	// This intentionally includes:
 	//   - gpt-4o, gpt-4.1, gpt-4-* (no native reasoning)
 	//   - gemini-* (Copilot proxies as OpenAI-compatible)
-	//   - grok-* (Copilot proxies as OpenAI-compatible)
-	//   - any unknown new family
+	//   - any unknown new family that still advertises /chat/completions
 	return { api: "openai-completions", reasoning: false };
 }
