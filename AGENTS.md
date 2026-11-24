@@ -1,7 +1,9 @@
 # AGENTS.md — pi-copilot-discovery
 
-A Pi 0.83+ extension that augments the built-in `github-copilot` provider with
-model definitions created from the tenant's live `/models` response.
+A Pi 1.5+ extension that augments the built-in `github-copilot` provider with
+model definitions created from the tenant's live `/models` response. This is a
+fork of `milespossing/pi-copilot-discovery`; see `docs/maintaining-fork.md` for
+remotes, credentials, and release steps.
 
 TypeScript is loaded directly by Pi through jiti; there is no build artifact.
 
@@ -45,19 +47,21 @@ src/families.ts  maps unfamiliar model families to Pi API/compat metadata
 
 ## Architecture
 
-Pi 0.83 already calls `/models`, but only extracts IDs and filters its static
+Pi already calls `/models`, but only extracts IDs and filters its static
 `GITHUB_COPILOT_MODELS` catalog. Unknown IDs still need this extension.
 
 ```text
-session_start
-  ├─ ctx.modelRegistry.getProvider("github-copilot")
+extension load
+  ├─ builtinProviders().find(id === "github-copilot")
   ├─ preserve the provider's auth, streams, base behavior, and ID
-  ├─ replace getModels/filterModels/refreshModels in a native Provider wrapper
-  └─ ctx.modelRegistry.refresh()
-       ├─ Pi refreshes the stored OAuth credential under its lock
-       ├─ extension receives the valid credential in RefreshModelsContext
-       ├─ GET <token-derived proxy>/models
-       └─ publish discovered Model[] entries
+  └─ pi.registerProvider(wrapper)   // before enabledModels scope resolution
+refreshModels offline phase
+  └─ restore context.stored via context.publish()
+session_start → ctx.modelRegistry.refresh()
+  ├─ Pi refreshes the stored OAuth credential under its lock
+  ├─ extension receives the credential (refreshModelsAuth: "credential")
+  ├─ GET <token-derived proxy>/models
+  └─ context.publish({ persist, update }) the discovered Model[] entries
 ```
 
 The extension does not read or write `auth.json`. Pi owns credentials,
@@ -65,18 +69,21 @@ persistence, token refresh, enterprise endpoint derivation, and logout.
 
 ## Critical rules
 
-### Require Pi 0.83+
+### Require Pi 1.5+
 
 Pi 0.83 removed `githubCopilotOAuthProvider`, `getGitHubCopilotBaseUrl`, and
 `normalizeDomain` from `@earendil-works/pi-ai/oauth`. Do not restore those old
-imports. The package's first compatible release is 0.4.0.
+imports. Pi 1.5 changed the provider runtime (remote catalog, `getAllModels`,
+persisted model store). The fork's first Pi 1.5 release is 0.5.0.
 
-### Wrap the effective provider
+### Register the built-in provider at load
 
-Do not import `@earendil-works/pi-ai/providers/github-copilot` from an
-extension. Pi's jiti aliasing currently treats that subpath as a suffix of its
-compat entry and fails resolution. Obtain the provider from
-`ctx.modelRegistry.getProvider("github-copilot")` during `session_start`.
+Take the provider from `builtinProviders()` in
+`@earendil-works/pi-ai/providers/all` and register the wrapper at extension
+load, not in `session_start`, so discovered models exist before
+`enabledModels` / `--models` scope resolution. Do not import
+`@earendil-works/pi-ai/providers/github-copilot`; Pi's extension aliasing does
+not resolve that subpath.
 
 ### Keep the provider ID `github-copilot`
 
@@ -89,7 +96,9 @@ quota attribution, vision behavior, and other Copilot request handling.
 The provider wrapper must spread the effective provider and override only:
 
 - `auth.oauth.login` (policy enablement only)
-- `getModels`
+- `refreshModelsAuth: "credential"` (Pi 1.5 marks the built-in catalog
+  `"configured"`, which passes no credential to `refreshModels`)
+- `getModels` and `getAllModels` (Pi reads `getAllModels` first)
 - `refreshModels`
 - `filterModels`
 
@@ -114,9 +123,9 @@ base URL. Enterprise tenants commonly use `api.enterprise.githubcopilot.com`.
 
 ### Retain the previous catalog on refresh failure
 
-`refreshModels` must update its in-memory model list only after a complete,
-non-empty response. Offline or failed refreshes leave the built-in or last
-successful catalog intact.
+`refreshModels` must update its model list only after a complete, non-empty
+response, and only through `context.publish()` so it is persisted. Offline or
+failed refreshes leave the built-in or last persisted catalog intact.
 
 ### Validate live response records
 
@@ -140,8 +149,8 @@ cause `400 Unsupported value` responses.
 
 Runtime imports come from Pi. Keep them in `devDependencies` for typechecking:
 
-- `@earendil-works/pi-coding-agent` >= 0.83.0
-- `@earendil-works/pi-ai` >= 0.83.0
+- `@earendil-works/pi-coding-agent` >= 1.5.0
+- `@earendil-works/pi-ai` >= 1.5.0
 - `@types/node`
 
 Do not add runtime npm dependencies without a compelling reason.
@@ -154,4 +163,6 @@ Do not add runtime npm dependencies without a compelling reason.
 4. Send a short real request through a live-only model.
 5. Run `/copilot-refresh` and verify its success notification.
 6. Update `package.json` version and lockfile.
-7. Commit, tag `vX.Y.Z`, and push the tag to trigger trusted npm publishing.
+7. Commit, tag `vX.Y.Z`, push `main` and the tag, then
+   `pi install git:github.com/cocoveal/pi-copilot-discovery@vX.Y.Z`.
+   The fork does not publish to npm.

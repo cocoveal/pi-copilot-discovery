@@ -4,9 +4,14 @@ A [pi](https://github.com/earendil-works/pi) extension that augments the
 built-in `github-copilot` provider with the full live model catalog returned by
 your Copilot tenant.
 
+This is a fork of
+[milespossing/pi-copilot-discovery](https://github.com/milespossing/pi-copilot-discovery)
+that targets Pi 1.5+. Upstream targets Pi 0.83 and fails on Pi 1.5 with `refresh
+failed: not logged in`. See [docs/maintaining-fork.md](./docs/maintaining-fork.md).
+
 ## Why
 
-Pi 0.83 performs **dynamic availability filtering**, but its model definitions
+Pi performs **dynamic availability filtering**, but its model definitions
 remain static:
 
 1. Pi calls Copilot's `/models` endpoint and records the available model IDs.
@@ -22,9 +27,12 @@ waiting for another Pi release.
 
 - **Preserves Pi's built-in provider.** Authentication, credential persistence,
   token refresh, enterprise endpoint selection, request headers, and streaming
-  remain owned by Pi 0.83's native `github-copilot` provider.
+  remain owned by Pi's native `github-copilot` provider.
 - **Discovers models on session start and after login.** The extension wraps the
-  effective provider with a native `refreshModels` implementation.
+  built-in provider with a native `refreshModels` implementation.
+- **Persists the live catalog.** Discovered models are stored through Pi's
+  model store (`~/.pi/agent/models-store.json`), so they survive restarts,
+  offline sessions, and `enabledModels` scope resolution in other processes.
 - **Refreshes on demand.** `/copilot-refresh` re-fetches the tenant catalog.
 - **Enables tenant policies after login.** The wrapped built-in OAuth login runs
   `POST /models/<id>/policy {"state":"enabled"}` for every discovered model.
@@ -35,31 +43,29 @@ waiting for another Pi release.
 
 ## Install
 
-### As a Pi package
+### From git (pinned tag)
 
 ```bash
-pi install npm:@milespossing/pi-copilot-discovery
+pi install git:github.com/cocoveal/pi-copilot-discovery@v0.5.0
 ```
 
 Or try it for one session:
 
 ```bash
-pi -e npm:@milespossing/pi-copilot-discovery
+pi -e git:github.com/cocoveal/pi-copilot-discovery@v0.5.0
 ```
 
-### Directly from git
-
-```bash
-pi install git:github.com/milespossing/pi-copilot-discovery
-pi -e git:github.com/milespossing/pi-copilot-discovery
-```
+The npm package `@milespossing/pi-copilot-discovery` is upstream's Pi 0.83
+build and does not work on Pi 1.5+.
 
 ### From a local checkout
 
 ```bash
-git clone https://github.com/milespossing/pi-copilot-discovery ~/src/pi-copilot-discovery
-ln -s ~/src/pi-copilot-discovery ~/.pi/agent/extensions/copilot-discovery
+git clone https://github.com/cocoveal/pi-copilot-discovery ~/src/pi-copilot-discovery
+pi -e ~/src/pi-copilot-discovery
 ```
+
+Remove an installed git package first, or both copies register the provider.
 
 Restart Pi or run `/reload`. Existing `github-copilot` credentials continue to
 work. If needed, run `/login github-copilot`.
@@ -75,15 +81,17 @@ work. If needed, run `/login github-copilot`.
 ## How it works
 
 ```text
-Pi initializes its built-in github-copilot provider
-  └─ session_start
-       ├─ extension obtains the effective provider from ctx.modelRegistry
-       ├─ wraps it without replacing auth or streaming
-       ├─ registers a native provider with refreshModels
-       └─ refreshModels receives Pi's already-refreshed credential
-            ├─ GET <credential-specific proxy>/models
-            ├─ build Model[] from the live response
-            └─ publish the live catalog synchronously through getModels()
+extension load
+  ├─ take github-copilot from builtinProviders() (@earendil-works/pi-ai/providers/all)
+  ├─ wrap it without replacing auth or streaming
+  └─ register it before enabledModels / --models scope resolution
+refreshModels (offline phase)
+  └─ restore the persisted live catalog from context.stored
+session_start → ctx.modelRegistry.refresh()
+  └─ refreshModels receives Pi's refreshed credential (refreshModelsAuth: "credential")
+       ├─ GET <credential-specific proxy>/models
+       ├─ build Model[] from the live response
+       └─ context.publish(): persist and expose via getModels()/getAllModels()
 ```
 
 The wrapper keeps the literal provider ID `github-copilot`, so Pi's built-in
@@ -122,11 +130,11 @@ for an unfamiliar family.
 
 ## Requirements
 
-- `@earendil-works/pi-coding-agent` >= 0.83.0
-- `@earendil-works/pi-ai` >= 0.83.0
+- `@earendil-works/pi-coding-agent` >= 1.5.0
+- `@earendil-works/pi-ai` >= 1.5.0
 - Node.js >= 22.19.0
 
-Version 0.4.0 uses Pi's native Provider and OAuth APIs.
+Version 0.5.0 is the first release for Pi 1.5+. Use upstream 0.4.x for Pi 0.83.
 
 ## Development
 
@@ -139,13 +147,15 @@ npx --yes --package typescript@5.9.3 tsc \
   src/index.ts src/models.ts src/oauth.ts src/families.ts
 ```
 
-For an end-to-end test, force-load the checkout with Pi 0.83, select a model
+For an end-to-end test, force-load the checkout with Pi 1.5+, select a model
 that is absent from Pi's bundled catalog, and send a short prompt.
+Verification commands are in [docs/maintaining-fork.md](./docs/maintaining-fork.md).
 
-## Publishing
+## Releasing
 
-Pushing a `v*.*.*` tag triggers the npm trusted-publishing workflow, which
-checks that the tag matches `package.json` before publishing.
+Releases are git tags consumed with `pi install git:...@vX.Y.Z`. The inherited
+npm publishing workflow runs on tag push but has no trusted publisher for this
+fork, so it does not publish.
 
 ## Layout
 
@@ -157,6 +167,8 @@ checks that the tag matches `package.json` before publishing.
 │   ├── oauth.ts     wrap native login only to enable discovered policies
 │   ├── models.ts    fetch /models and build native Model[] entries
 │   └── families.ts  map family/id to API and compatibility metadata
+├── docs/
+│   └── maintaining-fork.md  fork setup, release, and Pi 1.5 notes
 ├── AGENTS.md
 ├── README.md
 └── LICENSE

@@ -1,9 +1,9 @@
 /**
  * pi-copilot-discovery — dynamic GitHub Copilot model discovery for pi.
  *
- * Pi 0.83 owns the built-in provider's auth, token refresh, request base URL,
- * headers, and streaming. Once a session starts, this extension wraps that
- * effective provider and replaces only its model catalog with live /models data.
+ * Pi 1.5+ owns the built-in provider's auth, token refresh, request base URL,
+ * headers, and streaming. At load, this extension wraps that built-in provider
+ * and replaces only its model catalog with live /models data.
  */
 
 import type {
