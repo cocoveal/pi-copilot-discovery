@@ -107,7 +107,7 @@ by the proxy.
 | `claude-2.x`, `claude-3` (3.0–3.4) | `anthropic-messages` | no |
 | `gpt-5*`, `o1`, `o3` | `openai-responses` | yes |
 | responses-only (`supported_endpoints: ["/responses"]`) | `openai-responses` | if advertised |
-| `gpt-4*`, `gemini-*`, other chat-completions | `openai-completions` | no |
+| `gpt-4*`, `gemini-*`, other chat-completions | `openai-completions` | if `reasoning_effort` advertised |
 
 `supported_endpoints` wins for responses-only models such as `grok-4.5` and
 `mai-code-1-flash-picker`. Routing those to `/chat/completions` yields

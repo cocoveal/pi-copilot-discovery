@@ -14,7 +14,8 @@
  *   - gpt-5*     → openai-responses     (reasoning)
  *   - o1, o3     → openai-responses     (reasoning)
  *   - gpt-4*     → openai-completions   (no reasoning)
- *   - gemini-*   → openai-completions   (Copilot proxies Gemini through
+ *   - gemini-*   → openai-completions   (reasoning when /models advertises
+ *                                        reasoning_effort; Copilot proxies Gemini through
  *                                        an OpenAI-compatible endpoint;
  *                                        DO NOT route to google-generative-ai)
  *   - default    → openai-completions   (safe when /chat/completions works)
@@ -68,7 +69,7 @@ function normalizeEndpoints(endpoints: readonly string[] | undefined): Set<strin
 	return out;
 }
 
-function responsesThinkingMap(reasoningEffort: readonly string[] | undefined): ThinkingLevelMap {
+function effortThinkingMap(reasoningEffort: readonly string[] | undefined): ThinkingLevelMap {
 	const efforts = new Set((reasoningEffort ?? []).map((e) => e.toLowerCase()));
 	if (efforts.size === 0) return { ...OPENAI_RESPONSES_THINKING };
 
@@ -93,7 +94,7 @@ function classifyByEndpoints(options: ClassifyOptions): ApiFamily | undefined {
 		return {
 			api: "openai-responses",
 			reasoning: efforts.length > 0,
-			thinkingLevelMap: efforts.length > 0 ? responsesThinkingMap(efforts) : undefined,
+			thinkingLevelMap: efforts.length > 0 ? effortThinkingMap(efforts) : undefined,
 		};
 	}
 
@@ -154,16 +155,26 @@ export function classify(familyOrId: string, options: ClassifyOptions = {}): Api
 		return {
 			api: "openai-responses",
 			reasoning: true,
-			thinkingLevelMap: responsesThinkingMap(options.reasoningEffort),
+			thinkingLevelMap: effortThinkingMap(options.reasoningEffort),
 		};
 	}
 
 	if (fromEndpoints) return fromEndpoints;
 
-	// ---- Everything else → OpenAI Chat Completions (no reasoning) ----
+	// ---- Everything else → OpenAI Chat Completions ----
 	// This intentionally includes:
 	//   - gpt-4o, gpt-4.1, gpt-4-* (no native reasoning)
 	//   - gemini-* (Copilot proxies as OpenAI-compatible)
 	//   - any unknown new family that still advertises /chat/completions
+	// Reasoning only when Copilot advertises reasoning_effort (e.g. Gemini:
+	// low/medium/high, some also xhigh); Pi then sends `reasoning_effort`.
+	const efforts = options.reasoningEffort ?? [];
+	if (efforts.length > 0) {
+		return {
+			api: "openai-completions",
+			reasoning: true,
+			thinkingLevelMap: effortThinkingMap(efforts),
+		};
+	}
 	return { api: "openai-completions", reasoning: false };
 }
