@@ -19,7 +19,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { fetchCopilotModels, resolveCopilotBaseUrl, toProviderModels } from "./models.ts";
+import {
+	fetchCopilotModels,
+	resolveCopilotBaseUrl,
+	toProviderModels,
+	withBuiltinMetadata,
+} from "./models.ts";
 import { wrapCopilotOAuth } from "./oauth.ts";
 
 const PROVIDER_NAME = "github-copilot";
@@ -43,12 +48,16 @@ function createDiscoveryProvider(
 	onRefresh: (result: RefreshResult) => void,
 ): Provider {
 	let models: readonly Model<Api>[] = builtin.getModels();
+	const builtinById = new Map(models.map((m) => [m.id, m]));
 
 	const refreshModels = async (context: RefreshModelsContext): Promise<void> => {
 		// Restore the persisted live catalog so offline/early reads (other processes, t3code) see it.
-		const stored = context.stored?.models.filter((m) => m.provider === PROVIDER_NAME) as
-			| Model<Api>[]
-			| undefined;
+		// Re-overlay built-in metadata: entries persisted by <=0.5.1 lack compat.
+		const stored = (
+			context.stored?.models.filter((m) => m.provider === PROVIDER_NAME) as
+				| Model<Api>[]
+				| undefined
+		)?.map((m) => withBuiltinMetadata(m, builtinById));
 		if (stored?.length && !(await context.publish({ update: () => { models = stored; } }))) return;
 
 		if (!context.allowNetwork || context.signal?.aborted) return;
@@ -59,7 +68,7 @@ function createDiscoveryProvider(
 		try {
 			const baseUrl = await resolveCopilotBaseUrl(builtin, context.credential, token);
 			const raw = await fetchCopilotModels(token, baseUrl, context.signal);
-			const discovered = toProviderModels(raw, baseUrl);
+			const discovered = toProviderModels(raw, baseUrl, builtinById);
 			if (discovered.length === 0) {
 				onRefresh({ ok: false, error: "discovery returned no models" });
 				return;

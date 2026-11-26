@@ -93,7 +93,33 @@ export async function fetchCopilotModels(
 	);
 }
 
-export function toProviderModels(models: CopilotModel[], baseUrl: string): Model<Api>[] {
+/**
+ * Overlay pi-ai's curated metadata for models it already knows. Live /models
+ * stays authoritative for baseUrl, limits, and headers; classify() guesses
+ * only for IDs pi-ai lacks.
+ */
+export function withBuiltinMetadata(
+	model: Model<Api>,
+	builtinById: ReadonlyMap<string, Model<Api>>,
+): Model<Api> {
+	const builtin = builtinById.get(model.id);
+	if (!builtin) return model;
+	return {
+		...model,
+		api: builtin.api,
+		reasoning: builtin.reasoning,
+		thinkingLevelMap: builtin.thinkingLevelMap,
+		compat: builtin.compat || model.compat ? { ...model.compat, ...builtin.compat } : undefined,
+		input: builtin.input,
+		cost: builtin.cost,
+	} as Model<Api>;
+}
+
+export function toProviderModels(
+	models: CopilotModel[],
+	baseUrl: string,
+	builtinById: ReadonlyMap<string, Model<Api>> = new Map(),
+): Model<Api>[] {
 	const seen = new Set<string>();
 	const output: Model<Api>[] = [];
 	for (const model of models) {
@@ -108,7 +134,7 @@ export function toProviderModels(models: CopilotModel[], baseUrl: string): Model
 		const vision = model.capabilities?.supports?.vision === true;
 		const limits = model.capabilities?.limits ?? {};
 
-		output.push({
+		output.push(withBuiltinMetadata({
 			id: model.id,
 			name: model.name ?? model.id,
 			api,
@@ -123,7 +149,7 @@ export function toProviderModels(models: CopilotModel[], baseUrl: string): Model
 			maxTokens: limits.max_output_tokens ?? 16384,
 			headers: { ...COPILOT_HEADERS },
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		});
+		}, builtinById));
 	}
 	return output;
 }

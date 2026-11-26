@@ -117,10 +117,10 @@ export function classify(familyOrId: string, options: ClassifyOptions = {}): Api
 		const isClaude3OrOlder = /claude-(3(?!\.[57])|2|1)/.test(s) && !/-4|-5|-6|-7|-8|-9/.test(s);
 		const reasoning = !isClaude3OrOlder;
 
-		// pi-ai's built-in entries set forceAdaptiveThinking on Opus 4.6+
-		// and Sonnet 4.6+. Mirror that.
+		// pi-ai's built-in entries set forceAdaptiveThinking on Opus/Sonnet 4.6+
+		// and every claude-{kind}-5+ (e.g. Fable). Mirror that for unknown IDs.
 		const needsAdaptive =
-			/claude-opus-(4\.[6-9]|[5-9])/.test(s) || /claude-sonnet-(4\.[6-9]|[5-9])/.test(s);
+			/claude-(opus|sonnet)-4\.[6-9]/.test(s) || /claude-[a-z]+-([5-9]|[1-9]\d)(\.|-|$)/.test(s);
 
 		// Opus 4.7+ has an "xhigh" tier that maps to provider "xhigh".
 		const xhighMax = /claude-opus-(4\.[7-9]|[5-9])/.test(s);

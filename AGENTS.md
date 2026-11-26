@@ -19,6 +19,9 @@ npx --yes --package typescript@5.9.3 tsc \
   --allowImportingTsExtensions --skipLibCheck \
   src/index.ts src/models.ts src/oauth.ts src/families.ts
 
+# Unit tests (Node 23.6+ strips TS types natively)
+npm test
+
 # Interactive load test (use the unwrapped Pi binary when a configured wrapper
 # already force-loads the published extension)
 /path/to/pi --no-extensions -e ~/src/pi-copilot-discovery
@@ -27,8 +30,8 @@ npx --yes --package typescript@5.9.3 tsc \
 # Also run /copilot-refresh and verify the success notification.
 ```
 
-There is no unit-test suite or linter. Typecheck plus extension loading and one
-real Copilot request are the required validation.
+There is no linter. Typecheck, `npm test`, extension loading, and one real
+Copilot request are the required validation.
 
 ## Formatting
 
@@ -132,6 +135,15 @@ failed refreshes leave the built-in or last persisted catalog intact.
 Do not trust `/models` blindly. Keep only object records with a non-empty string
 `id`, chat capability, model-picker availability, and tool-call support. Dedup
 by ID before publishing.
+
+### Prefer pi-ai's built-in metadata
+
+When a discovered ID exists in `builtin.getModels()`, `withBuiltinMetadata()`
+takes `api`, `reasoning`, `compat`, `thinkingLevelMap`, `input`, and `cost`
+from the built-in model. Live `/models` keeps `baseUrl`, limits, and headers.
+Stored models are run through the same overlay on restore. `classify()` only
+handles IDs pi-ai does not know (e.g. it missed `forceAdaptiveThinking` for
+Claude Fable, which then got 400 `thinking.type.enabled`).
 
 ### Keep family routing conservative
 
