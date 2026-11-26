@@ -46,13 +46,13 @@ waiting for another Pi release.
 ### From git (pinned tag)
 
 ```bash
-pi install git:github.com/cocoveal/pi-copilot-discovery@v0.5.0
+pi install git:github.com/cocoveal/pi-copilot-discovery@v0.5.2
 ```
 
 Or try it for one session:
 
 ```bash
-pi -e git:github.com/cocoveal/pi-copilot-discovery@v0.5.0
+pi -e git:github.com/cocoveal/pi-copilot-discovery@v0.5.2
 ```
 
 The npm package `@milespossing/pi-copilot-discovery` is upstream's Pi 0.83

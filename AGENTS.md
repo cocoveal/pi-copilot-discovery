@@ -174,7 +174,8 @@ Do not add runtime npm dependencies without a compelling reason.
 3. Confirm `/model` includes at least one ID absent from Pi's static catalog.
 4. Send a short real request through a live-only model.
 5. Run `/copilot-refresh` and verify its success notification.
-6. Update `package.json` version and lockfile.
+6. Update `package.json` version and lockfile, and the pinned `@vX.Y.Z` install
+   refs in `README.md` and `docs/maintaining-fork.md` (`rg "@v0\."`).
 7. Commit, tag `vX.Y.Z`, push `main` and the tag, then
    `pi install git:github.com/cocoveal/pi-copilot-discovery@vX.Y.Z`.
    The fork does not publish to npm.
